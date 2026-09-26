@@ -2,7 +2,9 @@
 
 Linux-only local traffic collector. Go 1.27. Small eBPF programs observe host TCP/UDP
 flows (IPv4 and IPv6), collect approximate byte counts, and associate sockets
-with processes when possible. Packet payloads are never recorded.
+with processes when possible. Optionally, it also reads a MikroTik RouterOS 7
+router's REST API (read-only) to show other LAN devices' connections, VLANs,
+DHCP names and DNS-cache domains. Packet payloads are never recorded.
 
 ![Networker dashboard](docs/screenshot.png)
 
@@ -72,6 +74,61 @@ Optionally, networker also shows other devices' traffic by reading a RouterOS 7
 router's [REST API](https://help.mikrotik.com/docs/spaces/ROS/pages/47579162/REST+API)
 over HTTPS. Only GET requests are made; no router configuration is changed.
 
+### Router setup
+
+Run once in the RouterOS terminal (SSH or WinBox > New Terminal) as an admin.
+Examples use router `192.168.88.1` and networker host `192.168.88.10`; replace
+both with your own.
+
+1. Create a local CA, and an HTTPS certificate signed by it. The certificate's
+   name must match the address in `-router-url`, since networker verifies it:
+
+   ```
+   /certificate add name=local-ca common-name=local-ca key-usage=key-cert-sign,crl-sign
+   /certificate sign local-ca
+   /certificate add name=router-https common-name=192.168.88.1 subject-alt-name=IP:192.168.88.1
+   /certificate sign router-https ca=local-ca
+   ```
+
+2. Enable the HTTPS service with that certificate. The REST API is served by
+   `www-ssl` under `/rest`:
+
+   ```
+   /ip service set www-ssl certificate=router-https disabled=no
+   ```
+
+3. Create a group with policies `read,api,rest-api` (`rest-api` alone fails
+   with `not allowed (9)`), and a user limited to the networker host:
+
+   ```
+   /user group add name=networker-rest policy=read,api,rest-api
+   /user add name=networker group=networker-rest address=192.168.88.10/32 password="your-password"
+   ```
+
+4. Export the CA certificate (public part only) and copy it to the networker host:
+
+   ```
+   /certificate export-certificate local-ca
+   ```
+
+   ```sh
+   mkdir -p ~/.config/networker
+   scp admin@192.168.88.1:cert_export_local-ca.crt ~/.config/networker/mikrotik-local-ca.crt
+   ```
+
+5. Check access from the networker host:
+
+   ```sh
+   curl --cacert ~/.config/networker/mikrotik-local-ca.crt -u networker \
+     https://192.168.88.1/rest/system/resource
+   ```
+
+See MikroTik's docs for [certificates](https://help.mikrotik.com/docs/spaces/ROS/pages/2555969/Certificates),
+[services](https://help.mikrotik.com/docs/spaces/ROS/pages/103841820/Services)
+and [users](https://help.mikrotik.com/docs/spaces/ROS/pages/8978504/User).
+
+### Running with the router
+
 ```sh
 printf '%s' "$PASSWORD" | sudo networker ... \
   -router-url https://192.168.88.1 -router-user networker \
@@ -81,7 +138,7 @@ printf '%s' "$PASSWORD" | sudo networker ... \
 `-router-ca` is the PEM CA that signed the router's `www-ssl` certificate; only it
 is trusted for the router. The REST user needs policies `read,api,rest-api`
 (`rest-api` alone is refused). `start-mikrotik.sh` reads `CERT_NAME` (user) and
-`CERT_PASS` (password) from `.env` and pipes the password over stdin:
+`CERT_PASS` (password) from `.env` (gitignored) and pipes the password over stdin:
 
 ```sh
 CERT_NAME=networker

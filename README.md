@@ -4,6 +4,8 @@ Linux-only local traffic collector. Go 1.27. Small eBPF programs observe host TC
 flows (IPv4 and IPv6), collect approximate byte counts, and associate sockets
 with processes when possible. Packet payloads are never recorded.
 
+![Networker dashboard](docs/screenshot.png)
+
 ## Run
 
 eBPF program loading and root-cgroup attachment require suitable Linux

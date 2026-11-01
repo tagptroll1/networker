@@ -3,9 +3,9 @@ module github.com/tagptroll1/networker
 go 1.27.0
 
 require (
-	github.com/cilium/ebpf v0.19.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/oschwald/maxminddb-golang v1.13.1
-	golang.org/x/sys v0.31.0
+	golang.org/x/sys v0.43.0
 	modernc.org/sqlite v1.36.3
 )
 

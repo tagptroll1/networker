@@ -14,7 +14,7 @@ func TestEmbeddedPrograms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(spec.Programs) != 6 || spec.Maps["flows"] == nil || spec.Maps["owners"] == nil {
+	if len(spec.Programs) != 9 || spec.Maps["flows"] == nil || spec.Maps["owners"] == nil {
 		t.Fatalf("unexpected BPF objects: %d programs, %d maps", len(spec.Programs), len(spec.Maps))
 	}
 	if spec.Maps["flows"].KeySize != 40 || spec.Maps["flows"].ValueSize != 72 {

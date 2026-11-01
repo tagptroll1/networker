@@ -167,7 +167,8 @@ func parseDNSResponse(data []byte) []DNSAnswer {
 		if pos+length > len(data) {
 			break
 		}
-		if class == 1 && ttl > 0 {
+		// TTL 0 still counts: a block rule must not be dodged by answering with it.
+		if class == 1 {
 			r := record{owner: owner, ttl: min(ttl, time.Hour)}
 			switch {
 			case kind == 1 && length == 4, kind == 28 && length == 16:

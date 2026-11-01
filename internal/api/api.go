@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -15,6 +16,7 @@ import (
 	"github.com/tagptroll1/networker/internal/geo"
 	"github.com/tagptroll1/networker/internal/history"
 	"github.com/tagptroll1/networker/internal/names"
+	"github.com/tagptroll1/networker/internal/snitch"
 	"github.com/tagptroll1/networker/internal/tracker"
 )
 
@@ -23,13 +25,39 @@ type Origin struct {
 	Longitude float64 `json:"longitude"`
 }
 
+// Health tells clients fresh data from aging data: HTTP keeps answering while
+// polling fails.
+type Health struct {
+	lastOK          atomic.Int64 // unix ms
+	lastErr, dnsErr atomic.Pointer[string]
+}
+
+func (h *Health) PollOK(now time.Time) {
+	h.lastOK.Store(now.UnixMilli())
+	h.lastErr.Store(nil)
+}
+
+func (h *Health) PollFailed(err error) {
+	message := err.Error()
+	h.lastErr.Store(&message)
+}
+
+func (h *Health) DNSFailed(err error) {
+	message := err.Error()
+	h.dnsErr.Store(&message)
+}
+
 type Server struct {
-	Live    *tracker.Tracker
+	Live *tracker.Tracker
+	// History, Names, Geo and Snitch are optional; their endpoints exist only
+	// when they do.
 	History *history.Store
 	Names   *names.Cache
 	Geo     interface {
 		Find(netip.Addr) *geo.Location
 	}
+	Snitch *snitch.Monitor
+	Health *Health
 	Origin *Origin
 	// Devices describes LAN addresses when router integration is enabled.
 	Devices interface {
@@ -53,9 +81,23 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, struct {
-			Origin *Origin `json:"origin"`
-			Router bool    `json:"router"`
-		}{s.Origin, s.Devices != nil})
+			Origin  *Origin `json:"origin"`
+			Router  bool    `json:"router"`
+			History bool    `json:"history"`
+			Snitch  bool    `json:"snitch"`
+		}{s.Origin, s.Devices != nil, s.History != nil, s.Snitch != nil})
+	})
+	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		health := s.Health
+		if health == nil {
+			health = &Health{}
+		}
+		respond(w, struct {
+			Now        int64   `json:"now"`
+			LastPollOK int64   `json:"last_poll_ok"`
+			LastError  *string `json:"last_error"`
+			DNSError   *string `json:"dns_error"`
+		}{time.Now().UnixMilli(), health.lastOK.Load(), health.lastErr.Load(), health.dnsErr.Load()})
 	})
 	mux.HandleFunc("GET /api/flows", func(w http.ResponseWriter, r *http.Request) {
 		flows, err := s.flows(r.Context())
@@ -65,6 +107,48 @@ func (s *Server) Handler() http.Handler {
 		}
 		respond(w, flows)
 	})
+	if s.Snitch != nil {
+		s.snitchRoutes(mux)
+	}
+	if s.History != nil {
+		s.historyRoutes(mux)
+	}
+	mux.HandleFunc("GET /api/events", s.events)
+	return mux
+}
+
+func (s *Server) snitchRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/snitch/apps", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, s.Snitch.Apps())
+	})
+	mux.HandleFunc("GET /api/snitch/apps/{app}", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, s.Snitch.Destinations(r.PathValue("app")))
+	})
+	mux.HandleFunc("GET /api/snitch/alerts", func(w http.ResponseWriter, r *http.Request) {
+		after := uint64(0)
+		if v := r.URL.Query().Get("after"); v != "" {
+			var err error
+			if after, err = strconv.ParseUint(v, 10, 64); err != nil {
+				http.Error(w, "after must be a sequence number", http.StatusBadRequest)
+				return
+			}
+		}
+		seq, alerts := s.Snitch.Alerts(after)
+		respond(w, struct {
+			Seq    uint64         `json:"seq"`
+			Alerts []snitch.Alert `json:"alerts"`
+		}{seq, alerts})
+	})
+	mux.HandleFunc("GET /api/snitch/rules", func(w http.ResponseWriter, r *http.Request) {
+		enforcing, rules := s.Snitch.Status()
+		respond(w, struct {
+			Enforcing bool          `json:"enforcing"`
+			Rules     []snitch.Rule `json:"rules"`
+		}{enforcing, rules})
+	})
+}
+
+func (s *Server) historyRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/connections", func(w http.ResponseWriter, r *http.Request) {
 		limit := 100
 		if v := r.URL.Query().Get("limit"); v != "" {
@@ -106,7 +190,7 @@ func (s *Server) Handler() http.Handler {
 			if remote := s.lookup(record.RemoteIP); remoteName == "" && remote != nil {
 				remoteName = remote.Name
 			}
-			result = append(result, connection{record, s.Geo.Find(record.RemoteIP), remoteName})
+			result = append(result, connection{record, s.find(record.RemoteIP), remoteName})
 		}
 		respond(w, result)
 	})
@@ -160,48 +244,51 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.setLabel(w, r, func(name string) error { return s.History.SetIPLabel(r.Context(), ip, name) })
 	})
-	mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
-		send := func() bool {
-			flows, err := s.flows(r.Context())
-			if err != nil {
-				return false
-			}
-			data, err := json.Marshal(flows)
-			if err != nil {
-				return false
-			}
-			_, err = w.Write(append(append([]byte("event: flows\ndata: "), data...), '\n', '\n'))
-			if err == nil {
-				w.(http.Flusher).Flush()
-			}
-			return err == nil
+}
+
+func (s *Server) events(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	send := func() bool {
+		flows, err := s.flows(r.Context())
+		if err != nil {
+			return false
 		}
-		if !send() {
+		data, err := json.Marshal(flows)
+		if err != nil {
+			return false
+		}
+		_, err = w.Write(append(append([]byte("event: flows\ndata: "), data...), '\n', '\n'))
+		if err == nil {
+			w.(http.Flusher).Flush()
+		}
+		return err == nil
+	}
+	if !send() {
+		return
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
 			return
-		}
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-r.Context().Done():
+		case <-ticker.C:
+			if !send() {
 				return
-			case <-ticker.C:
-				if !send() {
-					return
-				}
 			}
 		}
-	})
-	return mux
+	}
 }
 
 func (s *Server) flows(ctx context.Context) ([]flow, error) {
-	labels, err := s.History.Labels(ctx)
-	if err != nil {
-		return nil, err
+	var labels history.Labels
+	if s.History != nil {
+		var err error
+		if labels, err = s.History.Labels(ctx); err != nil {
+			return nil, err
+		}
 	}
 	live := s.Live.Live(time.Now())
 	result := make([]flow, 0, len(live))
@@ -223,7 +310,7 @@ func (s *Server) flows(ctx context.Context) ([]flow, error) {
 		if label := labels.IPs[item.Remote.Addr().Unmap()]; label != "" {
 			name = label
 		}
-		result = append(result, flow{item, s.Geo.Find(item.Remote.Addr()), name})
+		result = append(result, flow{item, s.find(item.Remote.Addr()), name})
 	}
 	return result, nil
 }
@@ -239,6 +326,13 @@ func named(labels history.Labels, device *history.Device) *history.Device {
 		d.VLANName = labels.VLANs[d.VLAN]
 	}
 	return &d
+}
+
+func (s *Server) find(ip netip.Addr) *geo.Location {
+	if s.Geo == nil {
+		return nil
+	}
+	return s.Geo.Find(ip)
 }
 
 func (s *Server) lookup(ip netip.Addr) *history.Device {

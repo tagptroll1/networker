@@ -49,3 +49,14 @@ func TestDNSResponseIPv6AndMalformedPointer(t *testing.T) {
 		t.Fatalf("accepted malformed pointer: %+v", got)
 	}
 }
+
+func TestDNSResponseKeepsZeroTTL(t *testing.T) {
+	// One A record for a.test: 1.2.3.4 with TTL 0.
+	data := []byte{0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0,
+		1, 'a', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1,
+		0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 1, 2, 3, 4}
+	answers := parseDNSResponse(data)
+	if len(answers) != 1 || answers[0].Name != "a.test" || answers[0].TTL != 0 || answers[0].Address.String() != "1.2.3.4" {
+		t.Fatalf("%+v", answers)
+	}
+}

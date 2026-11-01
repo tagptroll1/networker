@@ -55,6 +55,100 @@ struct {
     __uint(max_entries, 1 << 20);
 } dns_queries SEC(".maps");
 
+// Prefix bits cover app then address, so one trie holds per-app and everyone
+// (app 0) rules. IPv4 is stored IPv4-mapped.
+struct block_key {
+    __u32 prefixlen;
+    __u32 app;
+    __u8 addr[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct block_key);
+    __type(value, __u8);
+} blocks SEC(".maps");
+
+// Process (tgid) to rule app id. Identity lives here so a forked child is
+// covered before its first connect, without waiting on userspace.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, __u32);
+} app_ids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} enforcing SEC(".maps");
+
+#define EVENT_EXEC 1
+#define EVENT_BLOCKED 2
+
+struct policy_event {
+    __u32 kind;
+    __u32 pid;
+    __u8 addr[16];
+    __u16 port;
+    __u8 protocol;
+    __u8 pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 18);
+} policy_events SEC(".maps");
+
+// Only the fields read; CO-RE resolves their offsets against the running kernel.
+struct task_struct {
+    int pid;
+    int tgid;
+} __attribute__((preserve_access_index));
+
+static __always_inline int is_blocked(__u32 pid, const __u8 *addr)
+{
+    __u32 zero = 0;
+    __u32 *on = bpf_map_lookup_elem(&enforcing, &zero);
+    if (!on || !*on)
+        return 0;
+    struct block_key key = { .prefixlen = 160 };
+    __builtin_memcpy(key.addr, addr, 16);
+    if (bpf_map_lookup_elem(&blocks, &key))
+        return 1;
+    __u32 *app = bpf_map_lookup_elem(&app_ids, &pid);
+    if (!app)
+        return 0;
+    key.app = *app;
+    return bpf_map_lookup_elem(&blocks, &key) != NULL;
+}
+
+static __always_inline void report_blocked(__u32 pid, const __u8 *addr, __u16 port, __u8 protocol)
+{
+    struct policy_event *event = bpf_ringbuf_reserve(&policy_events, sizeof(*event), 0);
+    if (!event)
+        return;
+    event->kind = EVENT_BLOCKED;
+    event->pid = pid;
+    __builtin_memcpy(event->addr, addr, 16);
+    event->port = port;
+    event->protocol = protocol;
+    event->pad = 0;
+    bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline void mapped4(__u8 *addr, __u32 ip)
+{
+    __builtin_memset(addr, 0, 10);
+    addr[10] = 0xff;
+    addr[11] = 0xff;
+    __builtin_memcpy(addr + 12, &ip, 4);
+}
+
 static __always_inline void remember_owner(struct bpf_sock_addr *ctx)
 {
     __u64 cookie = bpf_get_socket_cookie(ctx);
@@ -66,32 +160,99 @@ static __always_inline void remember_owner(struct bpf_sock_addr *ctx)
     bpf_map_update_elem(&owners, &cookie, &value, BPF_ANY);
 }
 
+// 1 lets the call through; 0 fails it with EPERM.
+static __always_inline int decide(struct bpf_sock_addr *ctx, const __u8 *addr)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (!is_blocked(pid, addr))
+        return 1;
+    report_blocked(pid, addr, bpf_ntohs(ctx->user_port), ctx->protocol);
+    return 0;
+}
+
+static __always_inline int decide4(struct bpf_sock_addr *ctx)
+{
+    __u8 addr[16];
+    mapped4(addr, ctx->user_ip4);
+    return decide(ctx, addr);
+}
+
+static __always_inline int decide6(struct bpf_sock_addr *ctx)
+{
+    __u32 words[4] = { ctx->user_ip6[0], ctx->user_ip6[1], ctx->user_ip6[2], ctx->user_ip6[3] };
+    return decide(ctx, (const __u8 *)words);
+}
+
 SEC("cgroup/connect4")
 int connect4(struct bpf_sock_addr *ctx)
 {
     remember_owner(ctx);
-    return 1;
+    return decide4(ctx);
 }
 
 SEC("cgroup/connect6")
 int connect6(struct bpf_sock_addr *ctx)
 {
     remember_owner(ctx);
-    return 1;
+    return decide6(ctx);
 }
 
 SEC("cgroup/sendmsg4")
 int sendmsg4(struct bpf_sock_addr *ctx)
 {
     remember_owner(ctx);
-    return 1;
+    return decide4(ctx);
 }
 
 SEC("cgroup/sendmsg6")
 int sendmsg6(struct bpf_sock_addr *ctx)
 {
     remember_owner(ctx);
-    return 1;
+    return decide6(ctx);
+}
+
+// A child inherits its parent's identity, so an app's helpers stay covered.
+SEC("tp_btf/sched_process_fork")
+int on_fork(__u64 *ctx)
+{
+    struct task_struct *parent = (void *)ctx[0];
+    struct task_struct *child = (void *)ctx[1];
+    __u32 child_id = child->pid;
+    // Threads share their process's entry.
+    if (child->pid != child->tgid)
+        return 0;
+    __u32 parent_id = parent->tgid;
+    __u32 *app = bpf_map_lookup_elem(&app_ids, &parent_id);
+    if (app)
+        bpf_map_update_elem(&app_ids, &child_id, app, BPF_ANY);
+    else
+        bpf_map_delete_elem(&app_ids, &child_id);
+    return 0;
+}
+
+SEC("tp_btf/sched_process_exit")
+int on_exit(__u64 *ctx)
+{
+    struct task_struct *task = (void *)ctx[0];
+    __u32 id = task->pid;
+    if (task->pid == task->tgid)
+        bpf_map_delete_elem(&app_ids, &id);
+    return 0;
+}
+
+// Userspace identifies the new program from /proc.
+SEC("tp_btf/sched_process_exec")
+int on_exec(__u64 *ctx)
+{
+    struct task_struct *task = (void *)ctx[0];
+    struct policy_event *event = bpf_ringbuf_reserve(&policy_events, sizeof(*event), 0);
+    if (!event)
+        return 0;
+    __builtin_memset(event, 0, sizeof(*event));
+    event->kind = EVENT_EXEC;
+    event->pid = task->tgid;
+    bpf_ringbuf_submit(event, 0);
+    return 0;
 }
 
 static __always_inline int account(struct __sk_buff *skb, int outbound)
@@ -138,19 +299,43 @@ static __always_inline int account(struct __sk_buff *skb, int outbound)
     key.local_port = outbound ? source : dest;
     key.remote_port = outbound ? dest : source;
 
+    // connect() alone is not enough: a block learned from a DNS answer can land
+    // just after the SYN left, and older sockets never connect again.
+    if (outbound) {
+        __u64 socket = bpf_get_socket_cookie(skb);
+        struct owner *sender = socket ? bpf_map_lookup_elem(&owners, &socket) : NULL;
+        __u32 pid = sender ? sender->pid : 0;
+        __u8 addr[16];
+        if (key.family == 4) {
+            __u32 remote;
+            __builtin_memcpy(&remote, key.remote, 4);
+            mapped4(addr, remote);
+        } else {
+            __builtin_memcpy(addr, key.remote, 16);
+        }
+        if (is_blocked(pid, addr)) {
+            report_blocked(pid, addr, dest, proto);
+            return 0;
+        }
+    }
+
     if (proto == 17 && ((outbound && dest == 53) || (!outbound && source == 53))) {
-        struct dns_event event = {};
         __u32 size = skb->len - offset - 8;
-        if (size > sizeof(event.data))
-            size = sizeof(event.data);
+        if (size > 272)
+            size = 272;
         // The verifier needs a direct nonzero bound on the variable-length read.
         if (size >= 12 && size <= skb->len) {
-            __builtin_memcpy(event.server, key.remote, 16);
-            event.family = key.family;
-            event.response = !outbound;
-            event.size = size;
-            if (bpf_skb_load_bytes(skb, offset + 8, event.data, size) == 0)
-                bpf_ringbuf_output(&dns_queries, &event, sizeof(event), 0);
+            struct dns_event *event = bpf_ringbuf_reserve(&dns_queries, sizeof(*event), 0);
+            if (event) {
+                __builtin_memcpy(event->server, key.remote, 16);
+                event->family = key.family;
+                event->response = !outbound;
+                event->size = size;
+                if (bpf_skb_load_bytes(skb, offset + 8, event->data, size) == 0)
+                    bpf_ringbuf_submit(event, 0);
+                else
+                    bpf_ringbuf_discard(event, 0);
+            }
         }
     }
 

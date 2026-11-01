@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -324,3 +325,10 @@ func (s *Store) ListDNS(ctx context.Context, since time.Time, limit int) ([]DNSQ
 	}
 	return queries, rows.Err()
 }
+
+// Discard stands in for a Store when no history is kept. IDs stay unique since
+// clients key live flows by them.
+type Discard struct{ next atomic.Int64 }
+
+func (d *Discard) Add(context.Context, Connection) (int64, error) { return d.next.Add(1), nil }
+func (d *Discard) Update(context.Context, Connection) error       { return nil }

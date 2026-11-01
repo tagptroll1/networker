@@ -35,7 +35,13 @@ type Collector struct {
 	links   []link.Link
 }
 
-func Open() (_ *Collector, err error) {
+// Options selects optional kernel hooks.
+type Options struct {
+	// Enforce attaches the process lifecycle hooks blocking relies on.
+	Enforce bool
+}
+
+func Open(options Options) (_ *Collector, err error) {
 	c := &Collector{}
 	if err := loadNetworkerObjects(&c.objects, nil); err != nil {
 		return nil, fmt.Errorf("load eBPF programs (requires BPF privileges): %w", err)
@@ -63,6 +69,15 @@ func Open() (_ *Collector, err error) {
 			return nil, fmt.Errorf("attach %s: %w", hook.name, attachErr)
 		}
 		c.links = append(c.links, l)
+	}
+	if options.Enforce {
+		for _, program := range []*ebpf.Program{c.objects.OnFork, c.objects.OnExit, c.objects.OnExec} {
+			l, attachErr := link.AttachTracing(link.TracingOptions{Program: program})
+			if attachErr != nil {
+				return nil, fmt.Errorf("attach process hook: %w", attachErr)
+			}
+			c.links = append(c.links, l)
+		}
 	}
 	return c, nil
 }

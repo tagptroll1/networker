@@ -67,8 +67,8 @@ func enrich(root string, flows []Flow) {
 			cache[pid] = info
 		}
 		flows[i].Executable, flows[i].Unit = info.executable, info.unit
-		if info.executable != "" {
-			flows[i].App = filepath.Base(info.executable)
+		if name := Identify(root, pid); name != "" {
+			flows[i].App = name
 		} else if flows[i].App == "" {
 			flows[i].App = info.comm
 		}

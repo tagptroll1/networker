@@ -28,3 +28,12 @@ func TestNamesExpireAndBounded(t *testing.T) {
 		t.Fatalf("cache size: %d", len(cache.entries))
 	}
 }
+
+func TestZeroTTLNamesNothing(t *testing.T) {
+	cache := New()
+	ip := netip.MustParseAddr("1.2.3.4")
+	cache.Remember([]capture.DNSAnswer{{Name: "a.test", Address: ip}}, time.Now())
+	if name := cache.Lookup(ip); name != "" {
+		t.Fatalf("named %q", name)
+	}
+}

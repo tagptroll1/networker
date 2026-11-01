@@ -1,3 +1,5 @@
+//go:build !headless
+
 package frontend
 
 import (
@@ -6,6 +8,9 @@ import (
 	"net/http"
 	"strings"
 )
+
+// Available reports whether this binary carries the dashboard.
+const Available = true
 
 //go:embed all:build
 var built embed.FS

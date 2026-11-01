@@ -2,16 +2,13 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -25,109 +22,169 @@ import (
 	"github.com/tagptroll1/networker/internal/history"
 	"github.com/tagptroll1/networker/internal/names"
 	"github.com/tagptroll1/networker/internal/router"
+	"github.com/tagptroll1/networker/internal/snitch"
 	"github.com/tagptroll1/networker/internal/tracker"
 )
 
+const procRoot = "/proc"
+
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8765", "loopback HTTP address")
-	city := flag.String("city-db", "", "path to GeoLite2-City.mmdb")
-	asn := flag.String("asn-db", "", "optional path to GeoLite2-ASN.mmdb")
-	state := os.Getenv("XDG_STATE_HOME")
-	if state == "" {
-		state = filepath.Join(os.Getenv("HOME"), ".local/state")
+	cfg, err := loadConfig(os.Environ(), frontend.Available)
+	if err != nil {
+		log.Fatal(err)
 	}
-	db := flag.String("db", filepath.Join(state, "networker", "history.db"), "history database")
-	lat := flag.Float64("origin-lat", math.NaN(), "approximate map origin latitude")
-	lon := flag.Float64("origin-lon", math.NaN(), "approximate map origin longitude")
-	retention := flag.Duration("retention", 30*24*time.Hour, "how long to retain connection summaries")
-	maxRecords := flag.Int("max-records", 50000, "maximum number of connection summaries")
-	routerURL := flag.String("router-url", "", "optional RouterOS REST base URL, e.g. https://192.168.0.1")
-	routerUser := flag.String("router-user", "networker", "RouterOS REST user")
-	routerPassword := flag.String("router-password-file", "", "file holding the RouterOS REST password (/dev/stdin works)")
-	routerCA := flag.String("router-ca", "", "PEM CA certificate that signed the router's HTTPS certificate")
-	flag.Parse()
-	if *retention <= 0 || *maxRecords <= 0 {
-		log.Fatal("retention and max-records must be positive")
-	}
-	if !api.Loopback(*listen) {
-		log.Fatal("-listen must be numeric loopback address and port")
-	}
-	if *city == "" {
-		log.Fatal("-city-db is required")
-	}
-	if math.IsNaN(*lat) != math.IsNaN(*lon) {
-		log.Fatal("set both origin coordinates or neither")
-	}
-	var origin *api.Origin
-	if !math.IsNaN(*lat) {
-		if math.IsInf(*lat, 0) || math.IsInf(*lon, 0) || *lat < -90 || *lat > 90 || *lon < -180 || *lon > 180 {
-			log.Fatal("invalid origin coordinates")
-		}
-		origin = &api.Origin{Latitude: *lat, Longitude: *lon}
-	}
+	server := &api.Server{Origin: cfg.origin, Health: &api.Health{}, Names: names.New()}
+
 	var gateway *router.Router
-	if *routerURL != "" {
-		if *routerPassword == "" || *routerCA == "" {
-			log.Fatal("-router-url needs -router-password-file and -router-ca")
-		}
-		password, err := os.ReadFile(*routerPassword)
+	if cfg.router.url != "" {
+		password, err := os.ReadFile(cfg.router.passwordFile)
 		if err != nil {
 			log.Fatal(err)
 		}
-		ca, err := os.ReadFile(*routerCA)
+		ca, err := os.ReadFile(cfg.router.caFile)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if gateway, err = router.New(*routerURL, *routerUser, strings.TrimRight(string(password), "\r\n"), ca); err != nil {
+		if gateway, err = router.New(cfg.router.url, cfg.router.user, strings.TrimRight(string(password), "\r\n"), ca); err != nil {
 			log.Fatal(err)
 		}
+		server.Devices = gateway
 	}
-	locations, err := geo.Open(*city, *asn)
-	if err != nil {
-		log.Fatal(err)
+	if cfg.cityDB != "" {
+		locations, err := geo.Open(cfg.cityDB, cfg.asnDB)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer locations.Close()
+		server.Geo = locations
 	}
-	defer locations.Close()
-	store, err := history.Open(*db)
-	if err != nil {
-		log.Fatal(err)
+	var records tracker.History = &history.Discard{}
+	if cfg.history {
+		store, err := history.Open(cfg.historyDB)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer store.Close()
+		server.History, records = store, store
 	}
-	defer store.Close()
-	collector, err := capture.Open()
-	if err != nil {
-		log.Fatal(err)
+
+	var collector *capture.Collector
+	var source tracker.Source
+	if cfg.capture {
+		if collector, err = capture.Open(capture.Options{Enforce: cfg.enforce}); err != nil {
+			log.Fatal(err)
+		}
+		defer collector.Close()
+		source = collector
 	}
-	defer collector.Close()
-	names := names.New()
+	track := tracker.New(source, records)
+	server.Live = track
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	dnsDone := make(chan struct{})
-	go func() {
-		defer close(dnsDone)
-		if err := collector.ReadDNS(ctx, func(ctx context.Context, query capture.DNSQuery, at time.Time) error {
-			return store.AddDNS(ctx, history.DNSQuery{QueriedAt: at, Name: query.Name, Type: query.Type, ServerIP: query.ServerIP})
-		}, names.Remember); err != nil && ctx.Err() == nil {
-			log.Printf("capture DNS: %v", err)
+	defer cancel()
+
+	var policy *snitch.Policy
+	remember := server.Names.Remember
+	if cfg.snitch {
+		var rules []snitch.Rule
+		if cfg.rulesFile != "" {
+			if rules, err = snitch.LoadRules(cfg.rulesFile); err != nil {
+				log.Fatal(err)
+			}
 		}
-	}()
-	defer func() { cancel(); <-dnsDone }()
-	track := tracker.New(collector, store)
-	server := &api.Server{Live: track, History: store, Names: names, Geo: locations, Origin: origin}
+		var enforcer snitch.Enforcer
+		if cfg.enforce {
+			enforcer = collector
+		}
+		policy = snitch.NewPolicy(rules, enforcer, func(pid uint32) string { return capture.Identify(procRoot, pid) })
+		monitor, err := snitch.Open(snitch.Options{Path: cfg.snitchDB, Learn: cfg.learn, Watch: cfg.watch, Quiet: cfg.quiet,
+			Retention: cfg.snitchKeep, MaxDestinations: cfg.snitchLimit}, policy)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer monitor.Close()
+		server.Snitch = monitor
+		remember = func(answers []capture.DNSAnswer, now time.Time) {
+			server.Names.Remember(answers, now)
+			policy.Answers(answers, now)
+		}
+		// Listening before Start, so a process started during the scan is not missed.
+		eventsDone := make(chan struct{})
+		go func() {
+			defer close(eventsDone)
+			err := collector.ReadEvents(ctx, func(event capture.Event) {
+				if !event.Blocked {
+					policy.Exec(event.PID)
+					return
+				}
+				app := capture.Identify(procRoot, event.PID)
+				if app == "" {
+					app = "unknown"
+				}
+				monitor.Blocked(time.Now(), app, server.Names.Lookup(event.Addr), event.Addr)
+			})
+			if err != nil && ctx.Err() == nil {
+				log.Printf("capture events: %v", err)
+			}
+		}()
+		defer func() { cancel(); <-eventsDone }()
+		if err := policy.Start(capture.Processes(procRoot)); err != nil {
+			log.Fatal(err)
+		}
+		if cfg.enforce {
+			log.Printf("snitch: enforcing %d rules", len(rules))
+		} else if len(rules) != 0 {
+			log.Printf("snitch: dry run, %d rules only flag matches", len(rules))
+		}
+	}
+
+	if cfg.capture {
+		ignore := func(context.Context, capture.DNSQuery, time.Time) error { return nil }
+		save := ignore
+		if cfg.history {
+			save = func(ctx context.Context, query capture.DNSQuery, at time.Time) error {
+				return server.History.AddDNS(ctx, history.DNSQuery{QueriedAt: at, Name: query.Name, Type: query.Type, ServerIP: query.ServerIP})
+			}
+		}
+		dnsDone := make(chan struct{})
+		go func() {
+			defer close(dnsDone)
+			if err := collector.ReadDNS(ctx, save, remember); err != nil && ctx.Err() == nil {
+				log.Printf("capture DNS: %v", err)
+				server.Health.DNSFailed(err)
+			}
+		}()
+		defer func() { cancel(); <-dnsDone }()
+	}
 	if gateway != nil {
-		server.Devices = gateway
 		routerDone := make(chan struct{})
 		go func() {
 			defer close(routerDone)
-			pollRouter(ctx, gateway, track, names)
+			pollRouter(ctx, gateway, track, remember, cfg.capture)
 		}()
 		defer func() { cancel(); <-routerDone }()
 	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/api/", server.Handler())
-	mux.Handle("/", frontend.Handler())
-	httpServer := &http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	if cfg.dashboard {
+		mux.Handle("/", frontend.Handler())
+	}
+	httpServer := &http.Server{Addr: cfg.listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	errors := make(chan error, 1)
 	go func() { errors <- httpServer.ListenAndServe() }()
-	log.Printf("networker listening at http://%s", *listen)
+	log.Printf("networker listening at http://%s", cfg.listen)
+
+	// A persistent failure would otherwise log every second.
+	var logged string
+	var loggedAt time.Time
+	failed := func(now time.Time, err error) {
+		server.Health.PollFailed(err)
+		if message := err.Error(); message != logged || now.Sub(loggedAt) >= time.Minute {
+			log.Printf("poll traffic: %s", message)
+			logged, loggedAt = message, now
+		}
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	prune := time.Now().Add(-time.Hour)
@@ -135,7 +192,8 @@ func main() {
 		select {
 		case err := <-errors:
 			if err != http.ErrServerClosed {
-				log.Fatal(err)
+				cancel()
+				log.Print(err)
 			}
 			return
 		case <-ctx.Done():
@@ -146,16 +204,36 @@ func main() {
 			done()
 			return
 		case now := <-ticker.C:
-			var ts unix.Timespec
-			if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
-				log.Print(err)
-				continue
+			if cfg.capture {
+				var ts unix.Timespec
+				if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+					failed(now, err)
+					continue
+				}
+				if err := track.Poll(ctx, now, uint64(ts.Nano())); err != nil {
+					failed(now, fmt.Errorf("poll traffic: %w", err))
+					continue
+				}
+				if logged != "" {
+					log.Print("poll traffic recovered")
+					logged = ""
+				}
 			}
-			if err := track.Poll(ctx, now, uint64(ts.Nano())); err != nil {
-				log.Print(fmt.Errorf("poll traffic: %w", err))
+			server.Health.PollOK(now)
+			if server.Snitch != nil {
+				live := track.Live(now)
+				seen := make([]snitch.Seen, 0, len(live))
+				for _, flow := range live {
+					seen = append(seen, snitch.Seen{Flow: flow, Host: server.Names.Lookup(flow.Remote.Addr())})
+				}
+				server.Snitch.Observe(now, seen)
+				policy.Sweep(now)
+				if err := server.Snitch.Tick(ctx, now); err != nil && ctx.Err() == nil {
+					log.Printf("save snitch: %v", err)
+				}
 			}
-			if now.Sub(prune) >= time.Hour {
-				if err := store.Prune(ctx, now.Add(-*retention), *maxRecords); err != nil {
+			if server.History != nil && now.Sub(prune) >= time.Hour {
+				if err := server.History.Prune(ctx, now.Add(-cfg.retention), cfg.maxRecords); err != nil {
 					log.Printf("prune history: %v", err)
 				}
 				prune = now
@@ -166,7 +244,12 @@ func main() {
 
 // pollRouter keeps router topology fresh and feeds other LAN devices'
 // connections and the router's DNS cache into the tracker and name cache.
-func pollRouter(ctx context.Context, gateway *router.Router, track *tracker.Tracker, cache *names.Cache) {
+func pollRouter(ctx context.Context, gateway *router.Router, track *tracker.Tracker, remember func([]capture.DNSAnswer, time.Time), capturing bool) {
+	// Without capture nothing else records this host, so the router view keeps it.
+	skip := func(netip.Addr) bool { return false }
+	if capturing {
+		skip = hostAddress()
+	}
 	var lastErr string
 	report := func(err error) {
 		// A failing router is logged once per distinct error, not every poll.
@@ -191,10 +274,10 @@ func pollRouter(ctx context.Context, gateway *router.Router, track *tracker.Trac
 				if err != nil {
 					return err
 				}
-				cache.Remember(answers, now)
+				remember(answers, now)
 				refreshed = now
 			}
-			connections, err := gateway.Connections(ctx, hostAddress())
+			connections, err := gateway.Connections(ctx, skip)
 			if err != nil {
 				return err
 			}

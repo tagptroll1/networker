@@ -13,6 +13,13 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type networkerBlockKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	App       uint32
+	Addr      [16]uint8
+}
+
 type networkerFlowKey struct {
 	_          structs.HostLayout
 	Local      [16]uint8
@@ -43,6 +50,28 @@ type networkerOwner struct {
 	Comm [16]int8
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	networkerMapAppIds       = "app_ids"
+	networkerMapBlocks       = "blocks"
+	networkerMapDnsQueries   = "dns_queries"
+	networkerMapEnforcing    = "enforcing"
+	networkerMapFlows        = "flows"
+	networkerMapOwners       = "owners"
+	networkerMapPolicyEvents = "policy_events"
+	networkerProgConnect4    = "connect4"
+	networkerProgConnect6    = "connect6"
+	networkerProgEgress      = "egress"
+	networkerProgIngress     = "ingress"
+	networkerProgOnExec      = "on_exec"
+	networkerProgOnExit      = "on_exit"
+	networkerProgOnFork      = "on_fork"
+	networkerProgSendmsg4    = "sendmsg4"
+	networkerProgSendmsg6    = "sendmsg6"
+)
+
 // loadNetworker returns the embedded CollectionSpec for networker.
 func loadNetworker() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_NetworkerBytes)
@@ -63,7 +92,7 @@ func loadNetworker() (*ebpf.CollectionSpec, error) {
 //	*networkerMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadNetworkerObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadNetworkerObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadNetworker()
 	if err != nil {
 		return err
@@ -89,6 +118,9 @@ type networkerProgramSpecs struct {
 	Connect6 *ebpf.ProgramSpec `ebpf:"connect6"`
 	Egress   *ebpf.ProgramSpec `ebpf:"egress"`
 	Ingress  *ebpf.ProgramSpec `ebpf:"ingress"`
+	OnExec   *ebpf.ProgramSpec `ebpf:"on_exec"`
+	OnExit   *ebpf.ProgramSpec `ebpf:"on_exit"`
+	OnFork   *ebpf.ProgramSpec `ebpf:"on_fork"`
 	Sendmsg4 *ebpf.ProgramSpec `ebpf:"sendmsg4"`
 	Sendmsg6 *ebpf.ProgramSpec `ebpf:"sendmsg6"`
 }
@@ -97,9 +129,13 @@ type networkerProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type networkerMapSpecs struct {
-	DnsQueries *ebpf.MapSpec `ebpf:"dns_queries"`
-	Flows      *ebpf.MapSpec `ebpf:"flows"`
-	Owners     *ebpf.MapSpec `ebpf:"owners"`
+	AppIds       *ebpf.MapSpec `ebpf:"app_ids"`
+	Blocks       *ebpf.MapSpec `ebpf:"blocks"`
+	DnsQueries   *ebpf.MapSpec `ebpf:"dns_queries"`
+	Enforcing    *ebpf.MapSpec `ebpf:"enforcing"`
+	Flows        *ebpf.MapSpec `ebpf:"flows"`
+	Owners       *ebpf.MapSpec `ebpf:"owners"`
+	PolicyEvents *ebpf.MapSpec `ebpf:"policy_events"`
 }
 
 // networkerVariableSpecs contains global variables before they are loaded into the kernel.
@@ -128,16 +164,24 @@ func (o *networkerObjects) Close() error {
 //
 // It can be passed to loadNetworkerObjects or ebpf.CollectionSpec.LoadAndAssign.
 type networkerMaps struct {
-	DnsQueries *ebpf.Map `ebpf:"dns_queries"`
-	Flows      *ebpf.Map `ebpf:"flows"`
-	Owners     *ebpf.Map `ebpf:"owners"`
+	AppIds       *ebpf.Map `ebpf:"app_ids"`
+	Blocks       *ebpf.Map `ebpf:"blocks"`
+	DnsQueries   *ebpf.Map `ebpf:"dns_queries"`
+	Enforcing    *ebpf.Map `ebpf:"enforcing"`
+	Flows        *ebpf.Map `ebpf:"flows"`
+	Owners       *ebpf.Map `ebpf:"owners"`
+	PolicyEvents *ebpf.Map `ebpf:"policy_events"`
 }
 
 func (m *networkerMaps) Close() error {
 	return _NetworkerClose(
+		m.AppIds,
+		m.Blocks,
 		m.DnsQueries,
+		m.Enforcing,
 		m.Flows,
 		m.Owners,
+		m.PolicyEvents,
 	)
 }
 
@@ -155,6 +199,9 @@ type networkerPrograms struct {
 	Connect6 *ebpf.Program `ebpf:"connect6"`
 	Egress   *ebpf.Program `ebpf:"egress"`
 	Ingress  *ebpf.Program `ebpf:"ingress"`
+	OnExec   *ebpf.Program `ebpf:"on_exec"`
+	OnExit   *ebpf.Program `ebpf:"on_exit"`
+	OnFork   *ebpf.Program `ebpf:"on_fork"`
 	Sendmsg4 *ebpf.Program `ebpf:"sendmsg4"`
 	Sendmsg6 *ebpf.Program `ebpf:"sendmsg6"`
 }
@@ -165,6 +212,9 @@ func (p *networkerPrograms) Close() error {
 		p.Connect6,
 		p.Egress,
 		p.Ingress,
+		p.OnExec,
+		p.OnExit,
+		p.OnFork,
 		p.Sendmsg4,
 		p.Sendmsg6,
 	)
